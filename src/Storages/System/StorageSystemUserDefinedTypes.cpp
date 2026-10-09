@@ -51,6 +51,16 @@ void StorageSystemUserDefinedTypes::fillData(MutableColumns & res_columns, Conte
     }
 }
 
+void StorageSystemUserDefinedTypes::backupData(BackupEntriesCollector & backup_entries_collector, const String & data_path_in_backup, const std::optional<ASTs> & /* partitions */)
+{
+    UserDefinedTypeFactory::instance().backup(backup_entries_collector, data_path_in_backup);
+}
+
+void StorageSystemUserDefinedTypes::restoreDataFromBackup(RestorerFromBackup & restorer, const String & data_path_in_backup, const std::optional<ASTs> & /* partitions */)
+{
+    UserDefinedTypeFactory::instance().restore(restorer, data_path_in_backup);
+}
+
 }
 
 /// Register the source file of this system table for `system.documentation`.

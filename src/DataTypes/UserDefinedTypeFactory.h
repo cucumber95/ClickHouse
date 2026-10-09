@@ -13,6 +13,8 @@ namespace DB
 {
 
 class IUserDefinedSQLObjectsStorage;
+class BackupEntriesCollector;
+class RestorerFromBackup;
 
 /// Prepares a `CREATE TYPE` query for storing: the `IF NOT EXISTS` / `OR REPLACE` flags are stripped,
 /// so the stored definition does not depend on how the type was created.
@@ -38,7 +40,8 @@ public:
     /// The definition is rejected when the name is a built-in type, alias or type family; when it references an
     /// unknown type, a known type family with a wrong number of arguments, or a user-defined type with a wrong
     /// number of arguments; and when it would make the type depend on itself. Replacing a type that other types
-    /// use is only allowed if the new definition keeps the number of parameters those uses rely on.
+    /// use is only allowed if the new definition keeps the number of parameters those uses rely on
+    /// and stays valid for the actual arguments they use it with.
     bool registerType(
         const ContextMutablePtr & current_context,
         const String & type_name,
@@ -60,6 +63,13 @@ public:
 
     /// The names of all user-defined types, sorted.
     std::vector<String> getAllRegisteredNames() const;
+
+    /// Makes backup entries for all user-defined types (`BACKUP TABLE system.user_defined_types`).
+    void backup(BackupEntriesCollector & backup_entries_collector, const String & data_path_in_backup) const;
+
+    /// Restores user-defined types from the backup. The types are registered after the types they are defined
+    /// through, and the `create_function` restore setting decides what happens to the types that already exist.
+    void restore(RestorerFromBackup & restorer, const String & data_path_in_backup) const;
 
 private:
     UserDefinedTypeFactory() = default;

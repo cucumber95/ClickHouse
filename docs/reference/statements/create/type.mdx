@@ -30,6 +30,9 @@ CREATE TYPE [IF NOT EXISTS | OR REPLACE] name [(parameter0, ...)] AS base_type
 `OR REPLACE` redefines an existing type. Without either, creating a type whose name is
 already taken raises the `TYPE_ALREADY_EXISTS` exception.
 
+The statement requires the `CREATE TYPE` privilege; `CREATE TYPE OR REPLACE` drops the
+previous definition, so it also requires the `DROP TYPE` privilege.
+
 There are a few restrictions:
 
 - The `base_type` must resolve to a valid data type. Referencing an unknown type
@@ -44,9 +47,11 @@ There are a few restrictions:
 - A type may reference other user-defined types, but the definitions may not form a
   cycle: `CREATE TYPE OR REPLACE` is rejected if the new definition would refer, directly
   or through other types, to the type being defined. A type that other types are defined
-  through can only be replaced by a definition with the same number of parameters, and
-  can not be dropped with [`DROP TYPE`](/reference/statements/drop) until those types are
-  dropped or redefined.
+  through can only be replaced by a definition with the same number of parameters that
+  stays valid for the arguments those types use it with (after
+  `CREATE TYPE A(T) AS Array(T); CREATE TYPE B AS A(UInt8)`, replacing `A` with
+  `Map(T)` is rejected), and can not be dropped with [`DROP TYPE`](/reference/statements/drop)
+  until those types are dropped or redefined.
 
 ## Persistence {#persistence}
 
@@ -55,6 +60,12 @@ either on the local disk in the `user_defined_path` directory of the server (by 
 `user_defined/` inside the server data path), or, if `user_defined_zookeeper_path` is
 configured, in ZooKeeper, in which case they are replicated to all servers sharing that
 path. They survive server restarts.
+
+`BACKUP TABLE system.user_defined_types` saves the definitions of all user-defined types,
+and `RESTORE TABLE system.user_defined_types` recreates them; the `create_function` restore
+setting decides whether the types that already exist are kept (the default), replaced, or
+cause an error. Restoring requires the `CREATE TYPE` privilege, and also `DROP TYPE` with
+`create_function = 'replace'`.
 
 **Example: a simple alias**
 

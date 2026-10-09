@@ -1,20 +1,27 @@
 #include <DataTypes/UserDefinedTypeFactory.h>
 
+#include <Backups/BackupEntriesCollector.h>
+#include <Backups/RestoreSettings.h>
+#include <Backups/RestorerFromBackup.h>
 #include <Common/Exception.h>
 #include <Common/quoteString.h>
 #include <Core/Settings.h>
 #include <DataTypes/DataTypeFactory.h>
 #include <Functions/UserDefined/IUserDefinedSQLObjectsStorage.h>
 #include <Functions/UserDefined/UserDefinedSQLObjectType.h>
+#include <Functions/UserDefined/UserDefinedSQLObjectsBackup.h>
 #include <Interpreters/Context.h>
 #include <Parsers/ASTCreateTypeQuery.h>
 #include <Parsers/ASTDataType.h>
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
+#include <Parsers/ASTLiteral.h>
+#include <Parsers/ASTObjectTypeArgument.h>
 #include <Poco/String.h>
 
 #include <algorithm>
+#include <unordered_map>
 #include <unordered_set>
 
 
@@ -86,8 +93,23 @@ struct TypeReference
     ASTPtr arguments;
 };
 
+/// The number of leading arguments of the type family `family_name` that are not types: the optional version and
+/// the aggregate function of `AggregateFunction([version, ]sum, UInt64)`, the function of `SimpleAggregateFunction`.
+size_t getNumberOfLeadingNonTypeArguments(const String & family_name, const ASTPtr & arguments)
+{
+    if (!arguments || arguments->children.empty())
+        return 0;
+    if (family_name == "AggregateFunction")
+        return arguments->children[0]->as<ASTLiteral>() ? 2 : 1;
+    if (family_name == "SimpleAggregateFunction")
+        return 1;
+    return 0;
+}
+
 /// Calls `callback` for every name that is used as a type inside `node`, in the order of occurrence.
 /// If the callback returns false, the arguments of that type are not descended into.
+/// Only the positions that hold types are visited: the names of aggregate functions, settings like
+/// `Dynamic(max_types = 10)`, `Enum` elements and the skipped paths of `JSON` are not types.
 template <typename Callback>
 void forEachTypeReference(const ASTPtr & node, Callback && callback)
 {
@@ -107,13 +129,30 @@ void forEachTypeReference(const ASTPtr & node, Callback && callback)
         if (!callback(TypeReference{.name = data_type->name, .num_arguments = num_arguments, .node = node, .arguments = arguments}))
             return;
 
-        if (arguments)
-            for (const auto & argument : arguments->children)
-                forEachTypeReference(argument, callback);
+        size_t num_non_type_arguments = getNumberOfLeadingNonTypeArguments(data_type->name, arguments);
+        for (size_t i = num_non_type_arguments; i < num_arguments; ++i)
+            forEachTypeReference(arguments->children[i], callback);
         return;
     }
 
-    /// Functions (e.g. the `equals` of an `Enum8('a' = 1)` element) and other nodes: only descend.
+    /// A `JSON` argument: only the type of a typed path (`a.b UInt32`) is a type.
+    if (const auto * object_argument = node->as<ASTObjectTypeArgument>())
+    {
+        forEachTypeReference(object_argument->path_with_type, callback);
+        return;
+    }
+    if (const auto * typed_path = node->as<ASTObjectTypedPathArgument>())
+    {
+        forEachTypeReference(typed_path->type, callback);
+        return;
+    }
+
+    /// Functions (the `equals` of an `Enum8('a' = 1)` element or of a setting like `max_types = 10`) and literals
+    /// are values, not types.
+    if (node->as<ASTFunction>() || node->as<ASTLiteral>())
+        return;
+
+    /// Other nodes (e.g. the name-type pairs of `Nested`): only descend.
     for (const auto & child : node->children)
         forEachTypeReference(child, callback);
 }
@@ -245,6 +284,166 @@ std::vector<DependentUse> findDependentUses(const IUserDefinedSQLObjectsStorage 
     return uses;
 }
 
+/// Whether the type expression `node` uses any of `parameter_names`, so it can only be instantiated with actual arguments.
+bool dependsOnParameters(const ASTPtr & node, const std::unordered_set<String> & parameter_names)
+{
+    bool result = false;
+    forEachTypeReference(node, [&](const TypeReference & ref) -> bool
+    {
+        if (ref.num_arguments == 0 && parameter_names.contains(ref.name))
+            result = true;
+        return !result;
+    });
+    return result;
+}
+
+/// The definition `registerType` is about to store in place of an existing one. While it is set, `tryGet` returns it
+/// instead of the stored definition of that type, so the types depending on it can be expanded as they would be
+/// after the replacement.
+thread_local ASTPtr pending_definition;
+
+struct PendingDefinitionGuard
+{
+    explicit PendingDefinitionGuard(ASTPtr definition) { pending_definition = std::move(definition); }
+    ~PendingDefinitionGuard() { pending_definition = nullptr; }
+};
+
+/// Throws if replacing `type_name` with `new_definition` makes the definition of another user-defined type invalid.
+/// Matching the number of parameters is not enough: after
+///     CREATE TYPE A(T) AS Array(T); CREATE TYPE B AS A(UInt8);
+/// the replacement `CREATE TYPE OR REPLACE A(T) AS Map(T)` would make `B` expand to the invalid `Map(UInt8)`.
+/// So every type depending on `type_name` (directly or through other types) is expanded with the new definition in
+/// place: as a whole if it has no parameters, otherwise each of its uses of the affected types that does not depend on
+/// its own parameters (`Tuple(T, B)` is checked through `B`; `A(T)` can only be checked when the type is used).
+void checkDependentsAfterReplacement(const IUserDefinedSQLObjectsStorage & storage, const String & type_name, const ASTPtr & new_definition)
+{
+    std::unordered_set<String> affected{type_name};
+    std::vector<String> dependents;
+    std::vector<String> to_visit{type_name};
+    while (!to_visit.empty())
+    {
+        String current = std::move(to_visit.back());
+        to_visit.pop_back();
+
+        for (const auto & use : findDependentUses(storage, current))
+        {
+            if (affected.insert(use.dependent_type_name).second)
+            {
+                dependents.push_back(use.dependent_type_name);
+                to_visit.push_back(use.dependent_type_name);
+            }
+        }
+    }
+
+    if (dependents.empty())
+        return;
+
+    std::sort(dependents.begin(), dependents.end());
+
+    const auto & data_type_factory = DataTypeFactory::instance();
+    PendingDefinitionGuard guard(new_definition);
+
+    for (const auto & dependent_name : dependents)
+    {
+        /// A type may disappear concurrently; then there is nothing to check.
+        auto create_query = storage.tryGet(dependent_name);
+        if (!create_query)
+            continue;
+
+        const auto & dependent = getCreateTypeQuery(*create_query);
+        auto parameter_names = getParameterNames(dependent);
+
+        try
+        {
+            if (parameter_names.empty())
+            {
+                data_type_factory.get(dependent.base_type);
+                continue;
+            }
+
+            forEachTypeReference(dependent.base_type, [&](const TypeReference & ref) -> bool
+            {
+                if (ref.num_arguments == 0 && parameter_names.contains(ref.name))
+                    return false;
+                if (!affected.contains(ref.name) || dependsOnParameters(ref.node, parameter_names))
+                    return true;
+                data_type_factory.get(ref.node);
+                return false;
+            });
+        }
+        catch (Exception & exception)
+        {
+            exception.addMessage(fmt::format(
+                "while checking user-defined type {} that depends on the replaced user-defined type {}",
+                backQuote(dependent_name), backQuote(type_name)));
+            throw;
+        }
+    }
+}
+
+/// Orders `objects` (pairs of a name and a `CREATE TYPE` query) so that every type comes after the types of
+/// `objects` it is defined through. Types that form a cycle are kept in their original relative order; registering
+/// them fails with a proper error.
+void sortByDependencies(VectorWithMemoryTracking<std::pair<String, ASTPtr>> & objects)
+{
+    std::unordered_map<String, size_t> index_by_name;
+    for (size_t i = 0; i < objects.size(); ++i)
+        index_by_name.emplace(objects[i].first, i);
+
+    std::vector<std::vector<size_t>> dependencies(objects.size());
+    for (size_t i = 0; i < objects.size(); ++i)
+    {
+        const auto & create = getCreateTypeQuery(*objects[i].second);
+        auto parameter_names = getParameterNames(create);
+        forEachTypeReference(create.base_type, [&](const TypeReference & ref) -> bool
+        {
+            if (ref.num_arguments == 0 && parameter_names.contains(ref.name))
+                return false;
+            if (auto it = index_by_name.find(ref.name); it != index_by_name.end() && it->second != i)
+                dependencies[i].push_back(it->second);
+            return true;
+        });
+    }
+
+    enum class State : uint8_t { NotVisited, InProgress, Done };
+    std::vector<State> states(objects.size(), State::NotVisited);
+    std::vector<size_t> order;
+    order.reserve(objects.size());
+
+    /// Iterative depth-first search: a definition can be deeply nested in a backup made from a hand-edited storage.
+    for (size_t root = 0; root < objects.size(); ++root)
+    {
+        if (states[root] != State::NotVisited)
+            continue;
+
+        std::vector<std::pair<size_t, size_t>> stack{{root, 0}};
+        states[root] = State::InProgress;
+        while (!stack.empty())
+        {
+            auto & [current, next_dependency] = stack.back();
+            if (next_dependency < dependencies[current].size())
+            {
+                size_t dependency = dependencies[current][next_dependency++];
+                if (states[dependency] == State::NotVisited)
+                {
+                    states[dependency] = State::InProgress;
+                    stack.emplace_back(dependency, 0);
+                }
+                continue;
+            }
+            states[current] = State::Done;
+            order.push_back(current);
+            stack.pop_back();
+        }
+    }
+
+    VectorWithMemoryTracking<std::pair<String, ASTPtr>> sorted;
+    sorted.reserve(objects.size());
+    for (size_t index : order)
+        sorted.push_back(std::move(objects[index]));
+    objects = std::move(sorted);
+}
+
 }
 
 
@@ -316,7 +515,10 @@ bool UserDefinedTypeFactory::registerType(
     if (parameter_names.empty())
         data_type_factory.get(create.base_type);
 
-    /// Other types keep using the replaced type with the number of arguments they were defined with.
+    auto normalized_query = normalizeCreateTypeQuery(create);
+
+    /// Other types keep using the replaced type with the number of arguments they were defined with, and the new
+    /// definition must stay valid for the actual arguments they use it with.
     if (replace_if_exists)
     {
         size_t new_num_parameters = parameter_names.size();
@@ -328,6 +530,8 @@ bool UserDefinedTypeFactory::registerType(
                                 "user-defined type {} uses it with {} argument(s)",
                                 backQuote(type_name), new_num_parameters, backQuote(use.dependent_type_name), use.num_arguments);
         }
+
+        checkDependentsAfterReplacement(storage, type_name, normalized_query);
     }
 
     try
@@ -336,7 +540,7 @@ bool UserDefinedTypeFactory::registerType(
             current_context,
             UserDefinedSQLObjectType::Type,
             type_name,
-            normalizeCreateTypeQuery(create),
+            normalized_query,
             throw_if_exists,
             replace_if_exists,
             current_context->getSettingsRef());
@@ -372,6 +576,9 @@ bool UserDefinedTypeFactory::unregisterType(const ContextMutablePtr & current_co
 
 ASTPtr UserDefinedTypeFactory::tryGet(const String & type_name) const
 {
+    if (pending_definition && getCreateTypeQuery(*pending_definition).name == type_name)
+        return pending_definition;
+
     const auto * storage = tryGetStorage();
     if (!storage)
         return nullptr;
@@ -404,6 +611,28 @@ std::vector<String> UserDefinedTypeFactory::getAllRegisteredNames() const
     /// The storage keeps the objects in a hash map; sort for a deterministic `SHOW TYPES`.
     std::sort(names.begin(), names.end());
     return names;
+}
+
+void UserDefinedTypeFactory::backup(BackupEntriesCollector & backup_entries_collector, const String & data_path_in_backup) const
+{
+    backupUserDefinedSQLObjects(
+        backup_entries_collector,
+        data_path_in_backup,
+        UserDefinedSQLObjectType::Type,
+        backup_entries_collector.getContext()->getUserDefinedTypesStorage().getAllObjects());
+}
+
+void UserDefinedTypeFactory::restore(RestorerFromBackup & restorer, const String & data_path_in_backup) const
+{
+    auto restored_types = restoreUserDefinedSQLObjects(restorer, data_path_in_backup, UserDefinedSQLObjectType::Type);
+    sortByDependencies(restored_types);
+
+    const auto & restore_settings = restorer.getRestoreSettings();
+    bool throw_if_exists = (restore_settings.create_function == RestoreUDFCreationMode::kCreate);
+    bool replace_if_exists = (restore_settings.create_function == RestoreUDFCreationMode::kReplace);
+    auto restore_context = restorer.getContext();
+    for (const auto & [type_name, create_type_query] : restored_types)
+        registerType(restore_context, type_name, create_type_query, throw_if_exists, replace_if_exists);
 }
 
 }
