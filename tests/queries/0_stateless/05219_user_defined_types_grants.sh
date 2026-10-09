@@ -3,7 +3,8 @@
 # Tag no-parallel: user-defined types live in a single process-wide namespace.
 
 # `CREATE TYPE`, `DROP TYPE`, `SHOW TYPES` / `SHOW TYPE` and `system.user_defined_types` are gated by the
-# `CREATE TYPE`, `DROP TYPE` and `SHOW USER DEFINED TYPES` privileges. Reading `system.user_defined_types`
+# `CREATE TYPE`, `DROP TYPE` and `SHOW USER DEFINED TYPES` privileges; `CREATE TYPE OR REPLACE` needs both
+# `CREATE TYPE` and `DROP TYPE`. Reading `system.user_defined_types`
 # with only `SHOW USER DEFINED TYPES` relies on the implicit `SELECT` grant on that table, which matters
 # when `select_from_system_db_requires_grant` is enabled (it is in CI).
 
@@ -45,9 +46,13 @@ $CLICKHOUSE_CLIENT --query "GRANT CREATE TYPE ON *.* TO ${USER}"
 $CLICKHOUSE_CLIENT --user="${USER}" --query "CREATE TYPE ${TYPE}2 AS String"
 $CLICKHOUSE_CLIENT --user="${USER}" --query "SHOW TYPE ${TYPE}2" | sed "s/${CLICKHOUSE_DATABASE}/DB/g"
 expect_denied "DROP TYPE ${TYPE}"
+# `OR REPLACE` drops the previous definition, so it also requires `DROP TYPE`.
+expect_denied "CREATE TYPE OR REPLACE ${TYPE}2 AS UInt8"
 
 echo "--- DROP TYPE"
 $CLICKHOUSE_CLIENT --query "GRANT DROP TYPE ON *.* TO ${USER}"
+$CLICKHOUSE_CLIENT --user="${USER}" --query "CREATE TYPE OR REPLACE ${TYPE}2 AS UInt8"
+$CLICKHOUSE_CLIENT --user="${USER}" --query "SHOW TYPE ${TYPE}2" | sed "s/${CLICKHOUSE_DATABASE}/DB/g"
 $CLICKHOUSE_CLIENT --user="${USER}" --query "DROP TYPE ${TYPE}2"
 $CLICKHOUSE_CLIENT --user="${USER}" --query "DROP TYPE ${TYPE}"
 $CLICKHOUSE_CLIENT --user="${USER}" --query "SELECT count() FROM system.user_defined_types WHERE name LIKE '${TYPE}%'"
